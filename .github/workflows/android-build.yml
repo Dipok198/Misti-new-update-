@@ -1,113 +1,220 @@
-
-name: MISTY Android Build
+name: MISTY - Auto Extract and Build APK
 
 on:
   push:
     branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      source_zip:
+        description: 'Optional: exact ZIP path in repository. Leave blank for automatic detection.'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: misty-build-${{ github.ref }}
+  group: misty-android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build MISTY APK
+    name: Extract source and build MISTY APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+
+    env:
+      ANDROID_COMPILE_SDK: '35'
+      ANDROID_BUILD_TOOLS: '35.0.0'
+      ANDROID_NDK_VERSION: '27.0.12077973'
+      ANDROID_CMAKE_VERSION: '3.22.1'
+      REQUESTED_SOURCE_ZIP: ${{ inputs.source_zip }}
 
     steps:
-      # 1. Download source code
-      - name: Checkout Source
+      - name: Checkout repository (including previously committed ZIP)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      # 2. Install Java
-      - name: Setup Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Setup Android SDK (FIXED)
-      - name: Setup Android SDK
+      # v4 avoids requesting Google's removed legacy "tools" SDK package.
+      - name: Set up Android command-line tools
         uses: android-actions/setup-android@v4
         with:
           packages: platform-tools
+          log-accepted-android-sdk-licenses: false
 
-      # 4. Setup Gradle
-      - name: Setup Gradle
+      - name: Locate and safely extract Android project ZIP
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os, re, shutil, zipfile
+          from pathlib import Path, PurePosixPath
+
+          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          temp = Path(os.environ['RUNNER_TEMP']) / 'misty-extracted'
+          requested = os.environ.get('REQUESTED_SOURCE_ZIP', '').strip()
+
+          def project_prefix(names):
+              clean = [n for n in names if n and not n.endswith('/')]
+              for name in clean:
+                  p = PurePosixPath(name)
+                  if p.name != 'gradlew':
+                      continue
+                  prefix = p.parent
+                  settings = {str(prefix / 'settings.gradle'), str(prefix / 'settings.gradle.kts')}
+                  app_files = {str(prefix / 'app/build.gradle'), str(prefix / 'app/build.gradle.kts')}
+                  if settings.intersection(clean) and app_files.intersection(clean):
+                      return prefix
+              return None
+
+          candidates = []
+          for z in repo.rglob('*'):
+              if not z.is_file() or z.suffix.lower() != '.zip':
+                  continue
+              if '.git' in z.parts:
+                  continue
+              try:
+                  with zipfile.ZipFile(z) as archive:
+                      prefix = project_prefix(archive.namelist())
+                      if prefix is not None:
+                          candidates.append((z, prefix, len(archive.namelist())))
+              except (zipfile.BadZipFile, OSError):
+                  print(f'Skipping invalid ZIP: {z.relative_to(repo)}')
+
+          selected = None
+          if requested:
+              matches = [c for c in candidates if str(c[0].relative_to(repo)) == requested or c[0].name == requested]
+              if not matches:
+                  raise SystemExit(f'Requested ZIP not found or does not contain a valid Android project: {requested}')
+              selected = sorted(matches, key=lambda c: c[2], reverse=True)[0]
+          elif candidates:
+              # Prefer a clearly named MISTY/Jarvis/Android source archive; otherwise
+              # choose the valid archive with the most entries.
+              def score(item):
+                  name = item[0].name.lower()
+                  named = bool(re.search(r'misty|jarvis|android|source', name))
+                  return (named, item[2], item[0].stat().st_size)
+              selected = max(candidates, key=score)
+
+          shutil.rmtree(temp, ignore_errors=True)
+          temp.mkdir(parents=True, exist_ok=True)
+
+          if selected:
+              archive_path, prefix, _ = selected
+              print(f'Using source ZIP: {archive_path.relative_to(repo)}')
+              print(f'Project folder inside ZIP: {prefix}')
+              with zipfile.ZipFile(archive_path) as archive:
+                  # Extract safely; reject absolute paths and path traversal entries.
+                  for info in archive.infolist():
+                      member = PurePosixPath(info.filename)
+                      if member.is_absolute() or '..' in member.parts:
+                          raise SystemExit(f'Unsafe ZIP entry rejected: {info.filename}')
+                      destination = (temp / Path(*member.parts)).resolve()
+                      if temp.resolve() not in destination.parents and destination != temp.resolve():
+                          raise SystemExit(f'Unsafe ZIP destination rejected: {info.filename}')
+                      if info.is_dir():
+                          destination.mkdir(parents=True, exist_ok=True)
+                      else:
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          with archive.open(info) as src, destination.open('wb') as dst:
+                              shutil.copyfileobj(src, dst)
+              project = (temp / Path(*prefix.parts)).resolve()
+          else:
+              # Also support a project that was already extracted into the repository.
+              print('No valid source ZIP found; checking extracted repository files.')
+              wrappers = list(repo.rglob('gradlew'))
+              wrappers = [p for p in wrappers if '.git' not in p.parts and 'build' not in p.parts]
+              if not wrappers:
+                  raise SystemExit('No Android source ZIP or gradlew found. Commit the original MISTY ZIP into this GitHub repository first.')
+              project = wrappers[0].parent
+
+          required = [
+              project / 'gradlew',
+              project / 'gradle/wrapper/gradle-wrapper.jar',
+              project / 'gradle/wrapper/gradle-wrapper.properties',
+              project / 'app/build.gradle.kts',
+          ]
+          settings_ok = (project / 'settings.gradle').is_file() or (project / 'settings.gradle.kts').is_file()
+          missing = [str(p.relative_to(project)) for p in required if not p.is_file()]
+          if not settings_ok:
+              missing.append('settings.gradle or settings.gradle.kts')
+          if missing:
+              raise SystemExit('Android project is incomplete. Missing: ' + ', '.join(missing))
+
+          os.chmod(project / 'gradlew', 0o755)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'MISTY_PROJECT_DIR={project}\n')
+          print(f'Validated Android project: {project}')
+          PY
+
+      - name: Install project Android SDK, NDK and CMake versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          install_packages() {
+            sdkmanager --install \
+              "platforms;android-${ANDROID_COMPILE_SDK}" \
+              "build-tools;${ANDROID_BUILD_TOOLS}" \
+              "platform-tools" \
+              "ndk;${ANDROID_NDK_VERSION}" \
+              "cmake;${ANDROID_CMAKE_VERSION}"
+          }
+          for attempt in 1 2 3; do
+            if install_packages; then
+              exit 0
+            fi
+            echo "SDK install attempt ${attempt} failed; retrying..."
+            sleep $((attempt * 10))
+          done
+          echo 'Android SDK package installation failed after 3 attempts.'
+          exit 1
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # 5. Find Android project
-      - name: Locate Android Project
+      - name: Verify Gradle wrapper and print project configuration
         shell: bash
         run: |
-          echo "Searching for Gradle wrapper..."
+          set -euo pipefail
+          cd "$MISTY_PROJECT_DIR"
+          chmod +x ./gradlew
+          echo '--- Gradle wrapper ---'
+          cat gradle/wrapper/gradle-wrapper.properties
+          echo '--- Android module ---'
+          grep -nE 'compileSdk|minSdk|targetSdk|ndkVersion|cmake|abiFilters' app/build.gradle.kts || true
 
-          GRADLEW_PATH=$(find . \
-            -type f \
-            -name gradlew \
-            -not -path './.git/*' \
-            -print -quit)
-
-          if [ -z "$GRADLEW_PATH" ]; then
-            echo "ERROR: gradlew not found!"
-            echo "Upload extracted Android source code."
-            exit 1
-          fi
-
-          PROJECT_DIR=$(dirname "$GRADLEW_PATH")
-
-          if [ ! -f "$PROJECT_DIR/settings.gradle" ] && \
-             [ ! -f "$PROJECT_DIR/settings.gradle.kts" ]; then
-            echo "ERROR: Android Gradle settings file missing!"
-            exit 1
-          fi
-
-          if [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "ERROR: Gradle wrapper JAR missing!"
-            exit 1
-          fi
-
-          chmod +x "$GRADLEW_PATH"
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Android project found: $PROJECT_DIR"
-
-      # 6. Build APK
-      - name: Build MISTY Debug APK
+      - name: Run unit tests and build Debug APK
         shell: bash
         run: |
-          cd "$PROJECT_DIR"
+          set -euo pipefail
+          cd "$MISTY_PROJECT_DIR"
+          ./gradlew --no-daemon --stacktrace clean testDebugUnitTest assembleDebug
 
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            clean assembleDebug
-
-      # 7. Upload APK
       - name: Upload MISTY APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MISTY-Android-APK
-          path: '**/build/outputs/apk/debug/*.apk'
+          path: ${{ env.MISTY_PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
 
-      # 8. Upload build logs if failed
-      - name: Upload Build Reports
+      - name: Upload diagnostic reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: MISTY-Build-Error-Reports
+          name: MISTY-Build-Diagnostics
           path: |
-            **/build/reports/
-            **/build/outputs/logs/
+            **/build/reports/**
+            **/build/outputs/logs/**
           if-no-files-found: ignore
+          retention-days: 7
